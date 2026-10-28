@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import asyncio
 import logging
+import urllib.request
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
@@ -16,40 +18,78 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Список всех поддерживаемых сервисов и их зеркал
+# Поддерживаемые домены
 SUPPORTED_DOMAINS = [
     # TikTok
-    "tiktok.com",
-    "douyin.com",
+    "tiktok.com", "douyin.com",
     # Instagram
-    "instagram.com",
-    "instagr.am",
-    "ddinstagram.com",
+    "instagram.com", "instagr.am", "ddinstagram.com",
     # Twitter / X
-    "twitter.com",
-    "x.com",
-    "fxtwitter.com",
-    "vxtwitter.com",
+    "twitter.com", "x.com", "fxtwitter.com", "vxtwitter.com",
     # YouTube
-    "youtube.com",
-    "youtu.be",
+    "youtube.com", "youtu.be",
     # VK
-    "vk.com",
-    "vkvideo.ru"
+    "vk.com", "vkvideo.ru"
 ]
 
+def twitter_fallback_download(url: str, output_filepath: str) -> str | None:
+    """Запасной метод для Twitter/X при блокировках или 18+ ограничениях."""
+    match = re.search(r"(?:twitter\.com|x\.com)/([^/?]+)/status/(\d+)", url)
+    if not match:
+        return None
+        
+    user, tweet_id = match.group(1), match.group(2)
+    api_url = f"https://api.fxtwitter.com/{user}/status/{tweet_id}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
+    try:
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            tweet = data.get("tweet", {})
+            
+            # Проверяем видео в самом твите или в цитате (quote tweet)
+            videos = tweet.get("media", {}).get("videos", [])
+            if not videos and "quote" in tweet:
+                videos = tweet["quote"].get("media", {}).get("videos", [])
+                
+            if videos and "url" in videos[0]:
+                direct_video_url = videos[0]["url"]
+                # Скачиваем прямое MP4 видео
+                dl_req = urllib.request.Request(direct_video_url, headers=headers)
+                with urllib.request.urlopen(dl_req, timeout=30) as dl_resp:
+                    with open(output_filepath, "wb") as f:
+                        f.write(dl_resp.read())
+                    return output_filepath
+    except Exception as e:
+        logging.error(f"Ошибка Twitter fallback: {e}")
+    return None
+
 def download_media(url: str) -> tuple[str | None, str | None]:
-    """Скачивание медиафайла через yt-dlp."""
+    """Основная функция загрузки медиа."""
     out_template = "downloads/%(id)s.%(ext)s"
+    
+    is_youtube = any(yt_domain in url.lower() for yt_domain in ["youtube.com", "youtu.be"])
+    is_twitter = any(tw_domain in url.lower() for tw_domain in ["twitter.com", "x.com"])
+
+    # Для YouTube склеиваем потоки. Для TikTok/Instagram/Twitter берем цельный mp4
+    # чтобы не перезаписывать оригинальный звук на фоновую музыку.
+    format_rule = (
+        "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        if is_youtube else
+        "best[ext=mp4]/best"
+    )
+
     ydl_opts = {
-        # Склейка лучшего видео до 1080p со звуком или взятие лучшего готового mp4
-        "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": format_rule,
         "outtmpl": out_template,
-        "max_filesize": 49 * 1024 * 1024,  # лимит 49 МБ для Telegram
+        "max_filesize": 49 * 1024 * 1024,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Обход блокировок YouTube и ограничений соцсетей
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios"]
@@ -60,14 +100,23 @@ def download_media(url: str) -> tuple[str | None, str | None]:
         }
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
+    # Попытка 1: Скачивание через стандартный yt-dlp
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info), None
-        except Exception as e:
-            err_msg = str(e)
-            logging.error(f"Ошибка загрузки: {err_msg}")
-            return None, err_msg
+    except Exception as e:
+        err_msg = str(e)
+        logging.warning(f"Основной метод не сработал ({err_msg}). Проверяем резервные методы...")
+
+        # Попытка 2: Если это Twitter/X, подключаем резервный FxTwitter шлюз
+        if is_twitter:
+            fallback_filename = f"downloads/tw_{os.urandom(4).hex()}.mp4"
+            fallback_res = twitter_fallback_download(url, fallback_filename)
+            if fallback_res:
+                return fallback_res, None
+
+        return None, err_msg
 
 async def process_url(message: Message, url: str):
     status_msg = await message.reply("⏳ Загружаю ролик...")
@@ -86,26 +135,20 @@ async def process_url(message: Message, url: str):
             if os.path.exists(file_path):
                 os.remove(file_path)
     else:
-        # Понятные пояснения частых ошибок
         err_str = str(error)
-        if "Sign in to confirm" in err_str:
-            msg = "❌ Сервис заблокировал скачивание без авторизации."
-        elif "File is larger than" in err_str or "max_filesize" in err_str:
+        if "File is larger than" in err_str or "max_filesize" in err_str:
             msg = "❌ Видео весит больше 50 МБ (максимум для Telegram бота)."
         elif "Private video" in err_str or "login" in err_str.lower():
-            msg = "❌ Этот аккаунт или видео закрыты настройками приватности."
+            msg = "❌ Видео или аккаунт закрыты настройками приватности."
         else:
-            msg = f"❌ Не удалось скачать. Ошибка: {error[:100] if error else 'неизвестно'}"
+            msg = f"❌ Не удалось скачать. Ошибка: {error[:100] if error else 'нет доступного видео в посте'}"
         await status_msg.edit_text(msg)
 
 def extract_valid_url(text: str) -> str | None:
-    """Извлекает и очищает первую поддерживаемую ссылку из текста."""
     if not text:
         return None
-        
     links = re.findall(r"https?://[^\s]+", text)
     for link in links:
-        # Убираем случайные точки, скобки и запятые на конце ссылок
         clean_link = link.rstrip(".,!?;:)\"'>»")
         lower_link = clean_link.lower()
         if any(domain in lower_link for domain in SUPPORTED_DOMAINS):
@@ -124,9 +167,9 @@ async def handle_chat_message(message: Message):
     if url:
         await process_url(message, url)
 
-# Веб-сервер для поддержания жизни на Render
+# Веб-сервер для поддержания активности на бесплатном тарифе Render
 async def health_check(request):
-    return web.Response(text="Bot is running OK!")
+    return web.Response(text="OK")
 
 async def start_web_server():
     app = web.Application()
