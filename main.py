@@ -16,27 +16,47 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Список поддерживаемых сервисов (ловит любые поддомены: vm.tiktok, vt.tiktok, m.youtube и т.д.)
-SUPPORTED_DOMAINS = ["tiktok.com", "youtube.com", "youtu.be", "instagram.com", "vk.com"]
+# Список всех поддерживаемых сервисов и их зеркал
+SUPPORTED_DOMAINS = [
+    # TikTok
+    "tiktok.com",
+    "douyin.com",
+    # Instagram
+    "instagram.com",
+    "instagr.am",
+    "ddinstagram.com",
+    # Twitter / X
+    "twitter.com",
+    "x.com",
+    "fxtwitter.com",
+    "vxtwitter.com",
+    # YouTube
+    "youtube.com",
+    "youtu.be",
+    # VK
+    "vk.com",
+    "vkvideo.ru"
+]
 
 def download_media(url: str) -> tuple[str | None, str | None]:
-    """Скачивание медиа. Возвращает (путь_к_файлу, текст_ошибки)."""
+    """Скачивание медиафайла через yt-dlp."""
     out_template = "downloads/%(id)s.%(ext)s"
     ydl_opts = {
+        # Склейка лучшего видео до 1080p со звуком или взятие лучшего готового mp4
         "format": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": out_template,
-        "max_filesize": 49 * 1024 * 1024,
+        "max_filesize": 49 * 1024 * 1024,  # лимит 49 МБ для Telegram
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Обход блокировки дата-центров YouTube (маскируемся под Android/iOS клиенты)
+        # Обход блокировок YouTube и ограничений соцсетей
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios"]
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
     }
     
@@ -50,7 +70,7 @@ def download_media(url: str) -> tuple[str | None, str | None]:
             return None, err_msg
 
 async def process_url(message: Message, url: str):
-    status_msg = await message.reply("⏳ Начинаю скачивание...")
+    status_msg = await message.reply("⏳ Загружаю ролик...")
     
     loop = asyncio.get_running_loop()
     file_path, error = await loop.run_in_executor(None, download_media, url)
@@ -61,26 +81,35 @@ async def process_url(message: Message, url: str):
             await message.reply_video(video=video)
             await status_msg.delete()
         except Exception as e:
-            await status_msg.edit_text(f"⚠️ Ошибка при отправке в Telegram: {e}")
+            await status_msg.edit_text(f"⚠️ Не удалось отправить видео в Telegram: {e}")
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
     else:
-        # Выводим понятную ошибку прямо в чат
-        if "Sign in to confirm" in str(error):
-            msg = "❌ YouTube заблокировал доступ к этому видео без авторизации."
-        elif "File is larger than" in str(error) or "max_filesize" in str(error):
-            msg = "❌ Видео весит больше 50 МБ (лимит Telegram бота)."
+        # Понятные пояснения частых ошибок
+        err_str = str(error)
+        if "Sign in to confirm" in err_str:
+            msg = "❌ Сервис заблокировал скачивание без авторизации."
+        elif "File is larger than" in err_str or "max_filesize" in err_str:
+            msg = "❌ Видео весит больше 50 МБ (максимум для Telegram бота)."
+        elif "Private video" in err_str or "login" in err_str.lower():
+            msg = "❌ Этот аккаунт или видео закрыты настройками приватности."
         else:
-            msg = f"❌ Не удалось скачать видео. Ошибка: {error[:120] if error else 'неизвестно'}"
+            msg = f"❌ Не удалось скачать. Ошибка: {error[:100] if error else 'неизвестно'}"
         await status_msg.edit_text(msg)
 
 def extract_valid_url(text: str) -> str | None:
-    # Ищем любую ссылку в сообщении
-    links = re.findall(r"https?://\S+", text or "")
+    """Извлекает и очищает первую поддерживаемую ссылку из текста."""
+    if not text:
+        return None
+        
+    links = re.findall(r"https?://[^\s]+", text)
     for link in links:
-        if any(domain in link.lower() for domain in SUPPORTED_DOMAINS):
-            return link
+        # Убираем случайные точки, скобки и запятые на конце ссылок
+        clean_link = link.rstrip(".,!?;:)\"'>»")
+        lower_link = clean_link.lower()
+        if any(domain in lower_link for domain in SUPPORTED_DOMAINS):
+            return clean_link
     return None
 
 @dp.channel_post()
@@ -95,9 +124,9 @@ async def handle_chat_message(message: Message):
     if url:
         await process_url(message, url)
 
-# Фоновый веб-сервер для поддержания активности на Render
+# Веб-сервер для поддержания жизни на Render
 async def health_check(request):
-    return web.Response(text="OK")
+    return web.Response(text="Bot is running OK!")
 
 async def start_web_server():
     app = web.Application()
