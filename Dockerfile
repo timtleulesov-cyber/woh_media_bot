@@ -11,4 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+# Python печатает логи сразу, а не пачками — удобнее смотреть в Render
+ENV PYTHONUNBUFFERED=1
+
+# TikTok/X регулярно ломают yt-dlp, поэтому при каждом старте подтягиваем свежую версию
+CMD ["sh", "-c", "pip install --no-cache-dir -U yt-dlp || true; python main.py"]
