@@ -11,6 +11,7 @@ import tempfile
 import subprocess
 import urllib.request
 from urllib.parse import urlparse
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -28,8 +29,10 @@ bot = Bot(token=TOKEN, session=AiohttpSession(timeout=300))
 dp = Dispatcher()
 
 DOWNLOAD_DIR = "downloads"
+
 # Лимит Bot API на отправку файла — 50 МБ, берём с запасом
 MAX_FILESIZE = 49 * 1024 * 1024
+
 # На бесплатном Render 512 МБ RAM — больше 2 загрузок одновременно не тянем
 download_semaphore = asyncio.Semaphore(int(os.getenv("MAX_PARALLEL_DOWNLOADS", 2)))
 
@@ -62,8 +65,12 @@ FAIL_MESSAGES = [
     "чет пошло не так, не смог достать ролик...",
     "увы, в этот раз не судьба..."
 ]
-TOO_BIG_MESSAGE = "ролик слишком жирный (больше 50 МБ), телега не пустит сори"
+
+TOO_BIG_MESSAGE = "ролик слишком жирный (как энгри джо = больше 50 МБ), телега не пустит сори"
 INSTAGRAM_LOGIN_MESSAGE = "инста не отдаёт ролик без логина, сори :("
+
+# Текст, который показывается, пока ролик скачивается
+LOADING_MESSAGE = "⏳сек..."
 
 # --- Перлы по нику ---
 
@@ -124,9 +131,9 @@ def pick_pearl(message: Message) -> str | None:
         template = personal.draw()
     else:
         template = common_deck.draw() or (personal.draw() if personal else None)
+
     if not template:
         return None
-
     return html.escape(template).replace("{name}", f"<b>{html.escape(name)}</b>")
 
 
@@ -168,7 +175,6 @@ def extract_valid_url(text: str) -> str | None:
         if host_matches(host, DISCORD_DOMAINS):
             if path.endswith(VIDEO_EXTENSIONS) or "/clips/" in path:
                 return clean_link
-
     return None
 
 
@@ -227,32 +233,56 @@ def discord_download(url: str, work_dir: str) -> dict | None:
         logging.warning(f"Не смог скачать из Discord {url}: {e}")
         return None
 
-def twitter_fallback_download(url: str, work_dir: str) -> dict | None:
-    """Резервное скачивание из Twitter/X через API в обход ограничений."""
+
+# --- Twitter / X ---
+
+def fetch_fx_tweet(url: str) -> dict | None:
+    """Достаёт данные поста через fxtwitter API. None — если не удалось получить."""
     match = re.search(r"/([^/?]+)/status/(\d+)", url)
     if not match:
         return None
-
     user, tweet_id = match.group(1), match.group(2)
     api_url = f"https://api.fxtwitter.com/{user}/status/{tweet_id}"
-    headers = {"User-Agent": USER_AGENT}
-
     try:
-        req = urllib.request.Request(api_url, headers=headers)
+        req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as response:
-            tweet = json.loads(response.read().decode()).get("tweet", {})
+            return json.loads(response.read().decode()).get("tweet") or None
+    except Exception as e:
+        logging.warning(f"fxtwitter API не ответил для {url}: {e}")
+        return None
 
-        # Проверяем видео в посте или цитате
-        videos = tweet.get("media", {}).get("videos", [])
-        if not videos and "quote" in tweet:
-            videos = tweet["quote"].get("media", {}).get("videos", [])
-        if not videos or "url" not in videos[0]:
-            return None
 
-        video = videos[0]
-        file_path = os.path.join(work_dir, f"tw_{tweet_id}.mp4")
+def tweet_videos(tweet: dict) -> list:
+    """Видео из поста или, если там пусто, из цитируемого поста."""
+    videos = (tweet.get("media") or {}).get("videos") or []
+    if not videos and tweet.get("quote"):
+        videos = (tweet["quote"].get("media") or {}).get("videos") or []
+    return videos
+
+
+def twitter_has_video(url: str) -> bool | None:
+    """True/False — если точно знаем, есть ли видео. None — если проверить не удалось."""
+    tweet = fetch_fx_tweet(url)
+    if tweet is None:
+        return None
+    return bool(tweet_videos(tweet))
+
+
+def twitter_fallback_download(url: str, work_dir: str) -> dict | None:
+    """Резервное скачивание из Twitter/X через API в обход ограничений."""
+    tweet = fetch_fx_tweet(url)
+    if not tweet:
+        return None
+
+    videos = tweet_videos(tweet)
+    if not videos or "url" not in videos[0]:
+        return None
+
+    video = videos[0]
+    tweet_id = re.search(r"/status/(\d+)", url).group(1)
+    file_path = os.path.join(work_dir, f"tw_{tweet_id}.mp4")
+    try:
         http_download(video["url"], file_path)
-
         return {
             "path": file_path,
             "width": video.get("width"),
@@ -263,7 +293,7 @@ def twitter_fallback_download(url: str, work_dir: str) -> dict | None:
         return {"error": "too_big"}
     except Exception as e:
         logging.error(f"Ошибка Twitter fallback: {e}")
-    return None
+        return None
 
 
 def download_media(url: str, work_dir: str) -> dict:
@@ -289,6 +319,7 @@ def download_media(url: str, work_dir: str) -> dict:
         "retries": 3,
         "http_headers": {"User-Agent": USER_AGENT},
     }
+
     if is_instagram:
         # Зеркала инсты yt-dlp не знает — переписываем на оригинальный домен
         url = re.sub(r"https?://(?:www\.)?(?:dd|kk)instagram\.com", "https://www.instagram.com", url)
@@ -296,21 +327,22 @@ def download_media(url: str, work_dir: str) -> dict:
             ydl_opts["cookiefile"] = INSTAGRAM_COOKIES_FILE
 
     error = None
+
     # Сначала пробуем через yt-dlp
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-        files = [f for f in glob.glob(os.path.join(work_dir, "*")) if not f.endswith(".part")]
-        if files:
-            return {
-                "path": files[0],
-                "width": info.get("width"),
-                "height": info.get("height"),
-                "duration": info.get("duration"),
-            }
-        # yt-dlp молча пропускает файлы больше max_filesize, без исключения
-        size = info.get("filesize") or info.get("filesize_approx") or 0
-        error = "too_big" if size > MAX_FILESIZE else "yt-dlp не скачал файл"
+            files = [f for f in glob.glob(os.path.join(work_dir, "*")) if not f.endswith(".part")]
+            if files:
+                return {
+                    "path": files[0],
+                    "width": info.get("width"),
+                    "height": info.get("height"),
+                    "duration": info.get("duration"),
+                }
+            # yt-dlp молча пропускает файлы больше max_filesize, без исключения
+            size = info.get("filesize") or info.get("filesize_approx") or 0
+            error = "too_big" if size > MAX_FILESIZE else "yt-dlp не скачал файл"
     except Exception as e:
         error = str(e)
         logging.warning(f"yt-dlp не справился с {url}: {error}")
@@ -328,11 +360,11 @@ def download_media(url: str, work_dir: str) -> dict:
 
 
 async def process_url(message: Message, url: str):
-    status_msg = await message.reply("⏳ Загружаю ролик...")
-
+    status_msg = await message.reply(LOADING_MESSAGE)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     # Своя папка на каждую загрузку — параллельные запросы не мешают друг другу, мусор не копится
     work_dir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
+
     try:
         async with download_semaphore:
             loop = asyncio.get_running_loop()
@@ -380,18 +412,32 @@ async def process_url(message: Message, url: str):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+async def should_process(url: str) -> bool:
+    """Для Твиттера сначала проверяем, есть ли в посте видео. Нет — молча игнорируем."""
+    host = (urlparse(url).hostname or "").lower()
+    if host_matches(host, TWITTER_DOMAINS):
+        loop = asyncio.get_running_loop()
+        has_video = await loop.run_in_executor(None, twitter_has_video, url)
+        if has_video is False:
+            logging.info(f"В посте нет видео, пропускаю: {url}")
+            return False
+    return True
+
+
+async def handle_message(message: Message):
+    url = extract_valid_url(message.text or message.caption)
+    if url and await should_process(url):
+        await process_url(message, url)
+
+
 @dp.channel_post()
 async def handle_channel_post(message: Message):
-    url = extract_valid_url(message.text or message.caption)
-    if url:
-        await process_url(message, url)
+    await handle_message(message)
 
 
 @dp.message()
 async def handle_chat_message(message: Message):
-    url = extract_valid_url(message.text or message.caption)
-    if url:
-        await process_url(message, url)
+    await handle_message(message)
 
 
 # Веб-сервер для фоновой работы на Render
@@ -413,6 +459,7 @@ async def main():
     # Чистим остатки от прошлого запуска
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
     await start_web_server()
     logging.info(f"yt-dlp {yt_dlp.version.__version__}, перлов: {len(PEARLS.get('common', []))} общих, {len(PEARLS['users'])} юзеров")
     logging.info("Бот успешно запущен...")
